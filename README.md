@@ -10,5 +10,5 @@ Lightweight terminal tool for monitoring CPU, memory, and processes.
 2. Build and run:
    ```bash
    cargo build --release  # Optimized build
-   ./target/release/system_usage_analyzer [SECONDS] [PROCESS_COUNT]
+   ./target/release/system_usage_analyzer [MILLISECONDS] [PROCESS_COUNT]
    ```
