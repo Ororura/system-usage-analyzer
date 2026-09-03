@@ -1,58 +1,64 @@
-use std::{env, thread, time};
-use sysinfo::{Pid, System};
+mod application;
+mod domain;
+mod infrastructure;
+
+use std::{
+    env,
+    thread,
+    time::Duration,
+};
+
+use application::monitor::SystemMonitor;
+use infrastructure::{
+    sysinfo_provider::SysinfoMetricsProvider,
+    terminal_renderer::TerminalRenderer,
+};
+
+const DEFAULT_REFRESH_INTERVAL_MS: u64 = 500;
+const DEFAULT_PROCESS_COUNT: usize = 10;
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let refresh_interval = args.get(1).and_then(|f| f.parse().ok()).unwrap_or(500);
-    let process_count = args.get(2).and_then(|f| f.parse().ok()).unwrap_or(10);
-    let pid = Pid::from(std::process::id() as usize);
+    let config = Config::from_args();
 
-    let mut system = System::new_all();
-    let delay = time::Duration::from_millis(refresh_interval);
+    let provider = SysinfoMetricsProvider::new();
+    let renderer = TerminalRenderer;
+
+    let mut monitor = SystemMonitor::new(
+        provider,
+        renderer,
+        config.process_count,
+    );
+
+    let delay = Duration::from_millis(config.refresh_interval_ms);
 
     loop {
-        print!("\x1B[2J\x1B[1;1H");
-
-        system.refresh_all();
-        thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-        system.refresh_cpu_all();
-
-        if let Some(process) = system.process(pid) {
-            println!(
-                "\nProgramm usage: CPU {:.1}%, RAM {:.1} MB",
-                process.cpu_usage(),
-                process.memory() as f64 / 1024.0 / 1024.0
-            );
-        }
-
-        println!("\nCPU Information:");
-        for cpu in system.cpus() {
-            println!("CPU: {} - {:.1}%", cpu.name(), cpu.cpu_usage());
-        }
-
-        let total_memory = system.total_memory();
-        let used_memory = system.used_memory();
-        println!(
-            "\nMemory: {:.1} GB/{:.1} GB used",
-            used_memory as f64 / 1024.0 / 1024.0,
-            total_memory as f64 / 1024.0 / 1024.0
-        );
-
-        println!("\nTop Memory-Consuming Processes:");
-        let mut processes: Vec<_> = system.processes().iter().collect();
-        processes.sort_by_key(|(_, process)| process.memory());
-        processes.reverse();
-
-        for (pid, process) in processes.iter().take(process_count) {
-            println!(
-                "PID: {}, Name: {:?}, CPU: {:.1}%, Memory: {:.1} MB",
-                pid,
-                process.name(),
-                process.cpu_usage(),
-                process.memory() as f64 / 1024.0 / 1024.0
-            );
-        }
-
+        monitor.tick();
         thread::sleep(delay);
+    }
+}
+
+struct Config {
+    refresh_interval_ms: u64,
+    process_count: usize,
+}
+
+impl Config {
+    fn from_args() -> Self {
+        let mut args = env::args().skip(1);
+
+        let refresh_interval_ms = args
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_REFRESH_INTERVAL_MS);
+
+        let process_count = args
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_PROCESS_COUNT);
+
+        Self {
+            refresh_interval_ms,
+            process_count,
+        }
     }
 }

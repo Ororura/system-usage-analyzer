@@ -4,5 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+crossterm = "0.29.0"
 piston_window = "0.132.0"
 sysinfo = "0.35.0"
