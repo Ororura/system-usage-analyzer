@@ -1,90 +1,126 @@
-use std::{thread, time::Duration};
-
-use sysinfo::{Pid, System};
-
 use crate::{
     application::monitor::SystemMetricsProvider,
-    domain::metrics::{CpuMetrics, MemoryMetrics, ProcessMetrics, SystemSnapshot},
+    domain::{
+        metrics::{CpuMetrics, MemoryMetrics, ProcessMetrics, SystemSnapshot},
+        process::{ProcessError, ProcessId, ProcessInfo, ProcessRepository, ProcessStatus},
+    },
 };
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 pub struct SysinfoMetricsProvider {
     system: System,
     current_pid: Pid,
 }
 
+impl Default for SysinfoMetricsProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl SysinfoMetricsProvider {
+    /// Seeds CPU counters without sleeping. The caller waits before the first sample.
     pub fn new() -> Self {
-        Self {
-            system: System::new_all(),
-            current_pid: Pid::from(std::process::id() as usize),
+        let mut provider = Self {
+            system: System::new(),
+            current_pid: Pid::from_u32(std::process::id()),
+        };
+        provider.refresh_processes();
+        provider.system.refresh_cpu_all();
+        provider
+    }
+    fn refresh_processes(&mut self) {
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory()
+                .with_exe(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet),
+        );
+    }
+    fn process_info(pid: Pid, process: &sysinfo::Process) -> ProcessInfo {
+        let status = match process.status() {
+            sysinfo::ProcessStatus::Run => ProcessStatus::Running,
+            sysinfo::ProcessStatus::Sleep => ProcessStatus::Sleeping,
+            sysinfo::ProcessStatus::Idle => ProcessStatus::Idle,
+            sysinfo::ProcessStatus::Stop | sysinfo::ProcessStatus::Tracing => {
+                ProcessStatus::Stopped
+            }
+            sysinfo::ProcessStatus::Zombie => ProcessStatus::Zombie,
+            sysinfo::ProcessStatus::Dead => ProcessStatus::Dead,
+            _ => ProcessStatus::Other,
+        };
+        ProcessInfo {
+            pid: ProcessId(pid.as_u32()),
+            parent_pid: process.parent().map(|p| ProcessId(p.as_u32())),
+            name: process.name().to_string_lossy().into_owned(),
+            executable: process.exe().map(ToOwned::to_owned),
+            command: (!process.cmd().is_empty()).then(|| {
+                process
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
+            cpu_usage: process.cpu_usage(),
+            memory_bytes: process.memory(),
+            status,
         }
     }
+}
 
-    fn process_metrics(pid: Pid, process: &sysinfo::Process) -> ProcessMetrics {
-        ProcessMetrics {
-            pid: pid.as_u32(),
-            name: process.name().to_string_lossy().into_owned(),
-            cpu_usage: process.cpu_usage(),
-            memory_mb: bytes_to_mb(process.memory()),
-        }
+impl ProcessRepository for SysinfoMetricsProvider {
+    fn processes(&mut self) -> Result<Vec<ProcessInfo>, ProcessError> {
+        self.refresh_processes();
+        Ok(self
+            .system
+            .processes()
+            .iter()
+            .map(|(&pid, p)| Self::process_info(pid, p))
+            .collect())
     }
 }
 
 impl SystemMetricsProvider for SysinfoMetricsProvider {
     fn snapshot(&mut self, process_limit: usize) -> SystemSnapshot {
-        self.system.refresh_all();
-
-        thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        self.refresh_processes();
         self.system.refresh_cpu_all();
-
-        let application = self
-            .system
-            .process(self.current_pid)
-            .map(|process| Self::process_metrics(self.current_pid, process));
-
-        let cpus = self
-            .system
-            .cpus()
-            .iter()
-            .map(|cpu| CpuMetrics {
-                name: cpu.name().to_owned(),
-                usage: cpu.cpu_usage(),
-            })
-            .collect();
-
-        let memory = MemoryMetrics {
-            used_gb: bytes_to_gb(self.system.used_memory()),
-            total_gb: bytes_to_gb(self.system.total_memory()),
-        };
-
-        let mut processes = self
-            .system
-            .processes()
-            .iter()
-            .map(|(pid, process)| Self::process_metrics(*pid, process))
-            .collect::<Vec<_>>();
-
-        processes.sort_by(|a, b| {
-            b.memory_mb
-                .partial_cmp(&a.memory_mb)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        self.system.refresh_memory();
+        let mut processes: Vec<_> = self.system.processes().iter().collect();
+        processes.sort_unstable_by(|(a_pid, a), (b_pid, b)| {
+            b.memory().cmp(&a.memory()).then_with(|| a_pid.cmp(b_pid))
         });
-
-        let top_processes = processes.into_iter().take(process_limit).collect();
-
+        let metrics = |pid: Pid, p: &sysinfo::Process| ProcessMetrics {
+            pid: pid.as_u32(),
+            name: p.name().to_string_lossy().into_owned(),
+            cpu_usage: p.cpu_usage(),
+            memory_mb: p.memory() as f64 / 1_048_576.0,
+        };
         SystemSnapshot {
-            application,
-            cpus,
-            memory,
-            top_processes,
+            application: self
+                .system
+                .process(self.current_pid)
+                .map(|p| metrics(self.current_pid, p)),
+            cpus: self
+                .system
+                .cpus()
+                .iter()
+                .map(|cpu| CpuMetrics {
+                    name: cpu.name().to_owned(),
+                    usage: cpu.cpu_usage(),
+                })
+                .collect(),
+            memory: MemoryMetrics {
+                used_gb: self.system.used_memory() as f64 / 1_073_741_824.0,
+                total_gb: self.system.total_memory() as f64 / 1_073_741_824.0,
+            },
+            top_processes: processes
+                .into_iter()
+                .take(process_limit)
+                .map(|(&pid, p)| metrics(pid, p))
+                .collect(),
         }
     }
-}
-
-fn bytes_to_mb(bytes: u64) -> f64 {
-    bytes as f64 / 1024.0 / 1024.0
-}
-
-fn bytes_to_gb(bytes: u64) -> f64 {
-    bytes as f64 / 1024.0 / 1024.0 / 1024.0
 }
